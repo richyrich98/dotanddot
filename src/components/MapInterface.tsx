@@ -112,6 +112,13 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   }, []);
 
   useEffect(() => {
+    // Debug geolocation permissions
+    if (navigator.permissions) {
+      navigator.permissions.query({ name: 'geolocation' }).then(function(result) {
+        console.log('Geolocation permission state:', result.state);
+      });
+    }
+
     // Get user's current location
     if (navigator.geolocation) {
       navigator.geolocation.getCurrentPosition(
@@ -119,14 +126,13 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
           const { latitude, longitude } = position.coords;
           const location = new LatLng(latitude, longitude);
           setUserLocation(location);
-          
-          // Center map on user location with higher zoom
           if (mapRef.current) {
             mapRef.current.setView(location, 19);
           }
         },
         (error) => {
-          console.warn('Could not get location:', error);
+          console.error('Geolocation error:', error);
+          alert(`Error: ${error.message} (code: ${error.code})`);
           // Default to a location in India if geolocation fails
           const defaultLocation = new LatLng(28.6139, 77.2090); // New Delhi
           setUserLocation(defaultLocation);
