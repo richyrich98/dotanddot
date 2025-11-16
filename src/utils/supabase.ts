@@ -41,10 +41,9 @@ export const getCurrentUser = async () => {
 
 // Sign in with Email
 
-// Set your redirect URL here
-// For production: use your deployed site URL (e.g., 'https://yourdomain.com')
-// For local testing: use your ngrok URL (e.g., 'https://abcd1234.ngrok.io')
-const SUPABASE_EMAIL_REDIRECT_URL = 'https://yourdomain.com'; // <-- update this as needed
+// Redirect URL used by Supabase email links and OAuth
+// Set VITE_SUPABASE_REDIRECT_URL in your environment (Vercel) to your production URL
+const SUPABASE_EMAIL_REDIRECT_URL = import.meta.env.VITE_SUPABASE_REDIRECT_URL || window.location?.origin || 'https://dotanddot.vercel.app';
 
 export const signInWithEmail = async (email: string) => {
   try {
@@ -87,7 +86,7 @@ export const signInWithGoogle = async () => {
     const { data, error } = await supabase.auth.signInWithOAuth({
       provider: 'google',
       options: {
-        redirectTo: window.location.origin
+        redirectTo: SUPABASE_EMAIL_REDIRECT_URL
       }
     });
     
