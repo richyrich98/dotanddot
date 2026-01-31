@@ -22,7 +22,7 @@ import {
   FolderOpen,
   Mail
 } from 'lucide-react';
-import { savePath, reportLocationAccuracy, saveUserPath, getUserPaths, shareUserPath } from '../utils/firebase';
+import { savePath, reportLocationAccuracy, saveUserPath, getUserPaths, shareUserPath, getAllLocationReports } from '../utils/firebase';
 import { getCurrentUser, signInWithEmail, signOut, onAuthStateChange } from '../utils/supabase';
 
 interface MapInterfaceProps {
@@ -37,6 +37,7 @@ interface SearchResult {
 }
 
 interface LocationReport {
+  id?: string;
   defaultLocation: [number, number];
   correctedLocation: [number, number];
   timestamp: string;
@@ -75,12 +76,14 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   const [user, setUser] = useState<any>(null);
   const [showSaveDialog, setShowSaveDialog] = useState(false);
   const [showUserPaths, setShowUserPaths] = useState(false);
+  const [showProfile, setShowProfile] = useState(false);
   const [pathName, setPathName] = useState('');
   const [pathDescription, setPathDescription] = useState('');
   const [isSaving, setIsSaving] = useState(false);
   const [saveSuccess, setSaveSuccess] = useState(false);
   const [userPaths, setUserPaths] = useState<SavedPath[]>([]);
   const [loadingPaths, setLoadingPaths] = useState(false);
+  const [locationReports, setLocationReports] = useState<LocationReport[]>([]);
   
   // Email OTP Authentication
   const [showAuthDialog, setShowAuthDialog] = useState(false);
@@ -286,7 +289,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
 
   const loadUserPaths = async () => {
     if (!user) return;
-    
+
     setLoadingPaths(true);
     try {
       const paths = await getUserPaths();
@@ -297,6 +300,27 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     } finally {
       setLoadingPaths(false);
     }
+  };
+
+  const loadLocationReports = async () => {
+    try {
+      const reports = await getAllLocationReports();
+      setLocationReports(reports);
+    } catch (error) {
+      console.error('Error loading location reports:', error);
+      // Silently fail - reports are optional
+    }
+  };
+
+  const handleShowProfile = async () => {
+    if (!user) return;
+
+    setShowProfile(true);
+    // Load data when opening profile
+    await Promise.all([
+      loadUserPaths(),
+      loadLocationReports()
+    ]);
   };
 
   const handleShowUserPaths = () => {
@@ -481,20 +505,43 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
         vertexData,
       };
 
-  console.log('[handleShare] Payload', pathData);
-  const pathId = await savePath(pathData);
+      console.log('[handleShare] Payload', pathData);
+      const pathId = await savePath(pathData);
       const shareUrl = `${window.location.origin}${window.location.pathname}?path=${pathId}`;
-      
-      // Copy to clipboard
-      await navigator.clipboard.writeText(shareUrl);
-      
-      setShareSuccess(true);
-      setTimeout(() => setShareSuccess(false), 3000);
-      
-      onPathShared(pathId);
+
+      console.log('[handleShare] Generated share URL:', shareUrl);
+
+      // Copy to clipboard with fallback
+      try {
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          await navigator.clipboard.writeText(shareUrl);
+        } else {
+          // Fallback for browsers that don't support clipboard API
+          const textArea = document.createElement('textarea');
+          textArea.value = shareUrl;
+          textArea.style.position = 'fixed';
+          textArea.style.left = '-999999px';
+          document.body.appendChild(textArea);
+          textArea.select();
+          document.execCommand('copy');
+          document.body.removeChild(textArea);
+        }
+
+        setShareSuccess(true);
+        setTimeout(() => setShareSuccess(false), 3000);
+
+        // Also show the URL in an alert as additional confirmation
+        alert(`Link copied to clipboard!\n\n${shareUrl}\n\nShare this link with anyone to show them your path.`);
+
+        onPathShared(pathId);
+      } catch (clipboardError) {
+        console.error('Clipboard error:', clipboardError);
+        // If clipboard fails, show the URL in a prompt so user can copy manually
+        prompt('Copy this link to share your path:', shareUrl);
+      }
     } catch (error) {
       console.error('Error sharing path:', error);
-      alert('Failed to share path. Please try again.');
+      alert(`Failed to share path: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again.`);
     } finally {
       setIsSharing(false);
     }
@@ -688,13 +735,22 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
           </div>
           
           {user && (
-            <button
-              onClick={handleSignOut}
-              className="flex items-center space-x-2 px-3 py-2 text-gray-600 hover:text-gray-900 transition-colors"
-            >
-              <LogOut className="w-4 h-4" />
-              <span className="text-sm">Sign out</span>
-            </button>
+            <div className="flex items-center space-x-2">
+              <button
+                onClick={handleShowProfile}
+                className="flex items-center space-x-2 px-3 py-2 bg-blue-50 text-blue-600 rounded-lg hover:bg-blue-100 transition-colors"
+              >
+                <User className="w-4 h-4" />
+                <span className="text-sm font-medium">Profile</span>
+              </button>
+              <button
+                onClick={handleSignOut}
+                className="flex items-center space-x-2 px-3 py-2 text-gray-600 hover:text-gray-900 transition-colors"
+              >
+                <LogOut className="w-4 h-4" />
+                <span className="text-sm">Sign out</span>
+              </button>
+            </div>
           )}
         </div>
       </div>
@@ -950,10 +1006,17 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
           }}
         >
           <NavigationControl />
-          {/* User location marker */}
+          {/* User location marker - enhanced visibility */}
           {userLocation && (
             <Marker longitude={userLocation[0]} latitude={userLocation[1]}>
-              <div style={{background:'#0074D9',borderRadius:'50%',width:16,height:16,border:'2px solid #fff'}} />
+              <div className="relative">
+                {/* Pulsing outer ring */}
+                <div className="absolute inset-0 rounded-full bg-blue-500 opacity-30 animate-ping" style={{width:32,height:32,top:-8,left:-8}} />
+                {/* Outer ring */}
+                <div className="absolute rounded-full bg-blue-500 opacity-20" style={{width:24,height:24,top:-4,left:-4}} />
+                {/* Main marker */}
+                <div className="relative rounded-full bg-blue-500 border-3 border-white shadow-lg" style={{width:16,height:16,boxShadow:'0 0 0 2px rgba(0,116,217,0.3)'}} />
+              </div>
             </Marker>
           )}
           {/* Corrected location marker (draggable) */}
@@ -1130,6 +1193,170 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
                 <Mail className="w-4 h-4" />
                 <span>{isAuthenticating ? 'Sending...' : 'Send Magic Link'}</span>
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Profile Dialog */}
+      {showProfile && user && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-[9999] p-4">
+          <div className="bg-white rounded-xl shadow-2xl max-w-3xl w-full max-h-[85vh] overflow-hidden">
+            <div className="p-6 border-b border-gray-200 bg-gradient-to-r from-blue-500 to-blue-600">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center space-x-3">
+                  <div className="w-12 h-12 bg-white rounded-full flex items-center justify-center">
+                    <User className="w-6 h-6 text-blue-600" />
+                  </div>
+                  <div>
+                    <h3 className="text-xl font-semibold text-white">My Profile</h3>
+                    <p className="text-sm text-blue-100">{user.email || 'No email available'}</p>
+                  </div>
+                </div>
+                <button
+                  onClick={() => setShowProfile(false)}
+                  className="text-white hover:text-blue-100 transition-colors"
+                >
+                  <X className="w-6 h-6" />
+                </button>
+              </div>
+            </div>
+
+            <div className="p-6 overflow-y-auto max-h-[calc(85vh-100px)]">
+              {/* Stats Overview */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
+                <div className="bg-blue-50 rounded-lg p-4">
+                  <div className="flex items-center space-x-3">
+                    <FolderOpen className="w-8 h-8 text-blue-600" />
+                    <div>
+                      <p className="text-2xl font-bold text-blue-900">{userPaths.length}</p>
+                      <p className="text-sm text-blue-600">Saved Paths</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="bg-green-50 rounded-lg p-4">
+                  <div className="flex items-center space-x-3">
+                    <MapIcon className="w-8 h-8 text-green-600" />
+                    <div>
+                      <p className="text-2xl font-bold text-green-900">
+                        {userPaths.reduce((sum, path) => sum + path.coordinates.length, 0)}
+                      </p>
+                      <p className="text-sm text-green-600">Total Points</p>
+                    </div>
+                  </div>
+                </div>
+                <div className="bg-orange-50 rounded-lg p-4">
+                  <div className="flex items-center space-x-3">
+                    <AlertTriangle className="w-8 h-8 text-orange-600" />
+                    <div>
+                      <p className="text-2xl font-bold text-orange-900">{locationReports.length}</p>
+                      <p className="text-sm text-orange-600">Location Reports</p>
+                    </div>
+                  </div>
+                </div>
+              </div>
+
+              {/* Saved Paths Section */}
+              <div className="mb-6">
+                <div className="flex items-center justify-between mb-4">
+                  <h4 className="text-lg font-semibold text-gray-900">Saved Paths</h4>
+                  <button
+                    onClick={() => {
+                      setShowProfile(false);
+                      setShowUserPaths(true);
+                    }}
+                    className="text-sm text-blue-600 hover:text-blue-700 font-medium"
+                  >
+                    View All →
+                  </button>
+                </div>
+                {userPaths.length === 0 ? (
+                  <div className="text-center py-8 bg-gray-50 rounded-lg">
+                    <FolderOpen className="w-12 h-12 text-gray-400 mx-auto mb-3" />
+                    <p className="text-gray-600">No saved paths yet</p>
+                    <p className="text-sm text-gray-500 mt-1">Draw and save your first path to see it here</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {userPaths.slice(0, 3).map((path) => (
+                      <div key={path.id} className="border border-gray-200 rounded-lg p-3 hover:bg-gray-50 transition-colors">
+                        <div className="flex items-center justify-between">
+                          <div className="flex-1">
+                            <h5 className="font-medium text-gray-900 text-sm">{path.name}</h5>
+                            <div className="flex items-center space-x-3 text-xs text-gray-500 mt-1">
+                              <span>{path.coordinates.length} points</span>
+                              <span>•</span>
+                              <span>{new Date(path.createdAt).toLocaleDateString()}</span>
+                            </div>
+                          </div>
+                          <button
+                            onClick={() => {
+                              handleLoadPath(path);
+                              setShowProfile(false);
+                            }}
+                            className="px-3 py-1 bg-blue-500 text-white text-xs rounded hover:bg-blue-600 transition-colors"
+                          >
+                            Load
+                          </button>
+                        </div>
+                      </div>
+                    ))}
+                    {userPaths.length > 3 && (
+                      <p className="text-sm text-gray-500 text-center mt-2">
+                        And {userPaths.length - 3} more...
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
+
+              {/* Location Reports Section */}
+              <div>
+                <h4 className="text-lg font-semibold text-gray-900 mb-4">Recent Location Reports</h4>
+                {locationReports.length === 0 ? (
+                  <div className="text-center py-8 bg-gray-50 rounded-lg">
+                    <AlertTriangle className="w-12 h-12 text-gray-400 mx-auto mb-3" />
+                    <p className="text-gray-600">No location reports yet</p>
+                    <p className="text-sm text-gray-500 mt-1">Report GPS inaccuracies to help improve the map</p>
+                  </div>
+                ) : (
+                  <div className="space-y-3">
+                    {locationReports.slice(0, 5).map((report, index) => (
+                      <div key={report.id || index} className="border border-gray-200 rounded-lg p-3 bg-orange-50">
+                        <div className="flex items-start justify-between">
+                          <div className="flex-1">
+                            <p className="text-sm font-medium text-orange-900 mb-1">
+                              Location Accuracy Report
+                            </p>
+                            <div className="grid grid-cols-2 gap-2 text-xs">
+                              <div>
+                                <p className="text-orange-700 font-medium">GPS Location:</p>
+                                <p className="text-orange-600">
+                                  {report.defaultLocation[1].toFixed(4)}, {report.defaultLocation[0].toFixed(4)}
+                                </p>
+                              </div>
+                              <div>
+                                <p className="text-orange-700 font-medium">Corrected:</p>
+                                <p className="text-orange-600">
+                                  {report.correctedLocation[1].toFixed(4)}, {report.correctedLocation[0].toFixed(4)}
+                                </p>
+                              </div>
+                            </div>
+                            <p className="text-xs text-orange-500 mt-2">
+                              {new Date(report.timestamp).toLocaleString()}
+                            </p>
+                          </div>
+                        </div>
+                      </div>
+                    ))}
+                    {locationReports.length > 5 && (
+                      <p className="text-sm text-gray-500 text-center mt-2">
+                        And {locationReports.length - 5} more reports...
+                      </p>
+                    )}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         </div>
