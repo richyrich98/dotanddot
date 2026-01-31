@@ -796,7 +796,18 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
                 const next = !enable3D;
                 setEnable3D(next);
                 const map = (mapRef.current?.getMap?.() || mapRef.current);
-                try { map?.setPitch?.(next ? 60 : 0); } catch (_) {}
+                if (map) {
+                  try {
+                    map.setPitch?.(next ? 60 : 0);
+                    if (next) {
+                      // Enable 3D: add terrain and buildings
+                      handleMapLoad({ target: map });
+                    } else {
+                      // Disable 3D: remove terrain and buildings
+                      disable3D(map);
+                    }
+                  } catch (_) {}
+                }
               }}
               className={`flex items-center space-x-2 px-3 py-2 rounded-lg border ${enable3D ? 'bg-white border-gray-300 hover:bg-gray-50' : 'bg-white border-gray-300 hover:bg-gray-50'}`}
               title="Toggle 3D terrain and buildings"
