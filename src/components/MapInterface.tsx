@@ -1,6 +1,8 @@
-import React, { useState, useRef, useEffect } from 'react';
-import { MapContainer, TileLayer, useMapEvents, useMap } from 'react-leaflet';
-import { LatLng, Map as LeafletMap } from 'leaflet';
+import React, { useState, useRef, useEffect, useMemo } from 'react';
+import Map, { Marker, NavigationControl, Source, Layer, Popup } from 'react-map-gl';
+import 'maplibre-gl/dist/maplibre-gl.css';
+import maplibregl from 'maplibre-gl';
+import mapboxgl from 'mapbox-gl';
 import { 
   Pencil, 
   Share2, 
@@ -9,7 +11,6 @@ import {
   Navigation, 
   Trash2,
   CheckCircle,
-  Copy,
   Crosshair,
   Search,
   X,
@@ -17,13 +18,12 @@ import {
   Send,
   Save,
   User,
-  LogIn,
   LogOut,
   FolderOpen,
   Mail
 } from 'lucide-react';
 import { savePath, reportLocationAccuracy, saveUserPath, getUserPaths, shareUserPath } from '../utils/firebase';
-import { getCurrentUser, signInWithEmail, verifyOtp, signOut, onAuthStateChange } from '../utils/supabase';
+import { getCurrentUser, signInWithEmail, signOut, onAuthStateChange } from '../utils/supabase';
 
 interface MapInterfaceProps {
   onPathShared: (pathId: string) => void;
@@ -49,16 +49,19 @@ interface SavedPath {
   coordinates: [number, number][];
   createdAt: string;
   userLocation?: [number, number];
+  vertexData?: Record<string, any>;
 }
 
 const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   const [isDrawing, setIsDrawing] = useState(false);
-  const [currentPath, setCurrentPath] = useState<LatLng[]>([]);
+  const [currentPath, setCurrentPath] = useState<[number, number][]>([]);
   const [mapType, setMapType] = useState<'standard' | 'satellite'>('satellite');
-  const [userLocation, setUserLocation] = useState<LatLng | null>(null);
-  const [correctedLocation, setCorrectedLocation] = useState<LatLng | null>(null);
+  const [userLocation, setUserLocation] = useState<[number, number] | null>(null);
+  const [correctedLocation, setCorrectedLocation] = useState<[number, number] | null>(null);
   const [isSharing, setIsSharing] = useState(false);
   const [shareSuccess, setShareSuccess] = useState(false);
+  // For dragging corrected location
+
   const [searchQuery, setSearchQuery] = useState('');
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -81,17 +84,22 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   
   // Email OTP Authentication
   const [showAuthDialog, setShowAuthDialog] = useState(false);
-  const [authStep, setAuthStep] = useState<'email' | 'otp'>('email');
   const [email, setEmail] = useState('');
-  const [otp, setOtp] = useState('');
   const [isAuthenticating, setIsAuthenticating] = useState(false);
   const [authError, setAuthError] = useState<string | null>(null);
   
-  const mapRef = useRef<LeafletMap | null>(null);
+  const mapRef = useRef<any>(null);
+  const didCenterRef = useRef<boolean>(false);
   const searchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
-  const pathMarkersRef = useRef<any[]>([]);
-  const userLocationMarkerRef = useRef<any>(null);
-  const correctedLocationMarkerRef = useRef<any>(null);
+
+  // 3D toggle state
+  const [enable3D, setEnable3D] = useState<boolean>(true);
+  // Vertex notes and finish state for drawn path
+  const [vertexNotes, setVertexNotes] = useState<Record<number, string>>({});
+  const [activeNoteIndex, setActiveNoteIndex] = useState<number | null>(null);
+  const [noteDraft, setNoteDraft] = useState<string>('');
+  // hover state no longer needed with circle layer picking
+  const [pathFinished, setPathFinished] = useState<boolean>(false);
 
   useEffect(() => {
     // Check authentication state
@@ -104,12 +112,36 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     // Listen for auth changes
     const { data: { subscription } } = onAuthStateChange((user) => {
       setUser(user);
+      // If this window was opened by a magic link in a new tab, close it and focus the original
+      try {
+        if (user && window.opener) {
+          // Focus original tab
+          window.opener.focus();
+          // Replace current URL to avoid leaving a hash or query, then close
+          window.history.replaceState({}, document.title, window.opener.location?.href || '/');
+          window.close();
+        }
+      } catch (e) {
+        // Ignore errors, continue normal flow
+      }
     });
 
     return () => {
       subscription?.unsubscribe();
     };
   }, []);
+
+  // When userLocation becomes available the first time, center the map
+  useEffect(() => {
+    const map = (mapRef.current?.getMap?.() || mapRef.current);
+    if (!map || !userLocation) return;
+    if (!didCenterRef.current) {
+      try {
+        map.flyTo?.({ center: userLocation, zoom: 16 });
+        didCenterRef.current = true;
+      } catch (_) {}
+    }
+  }, [userLocation]);
 
   useEffect(() => {
     // Debug geolocation permissions
@@ -124,21 +156,12 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
       navigator.geolocation.getCurrentPosition(
         (position) => {
           const { latitude, longitude } = position.coords;
-          const location = new LatLng(latitude, longitude);
-          setUserLocation(location);
-          if (mapRef.current) {
-            mapRef.current.setView(location, 19);
-          }
+          setUserLocation([longitude, latitude]);
         },
         (error) => {
           console.error('Geolocation error:', error);
           alert(`Error: ${error.message} (code: ${error.code})`);
-          // Default to a location in India if geolocation fails
-          const defaultLocation = new LatLng(28.6139, 77.2090); // New Delhi
-          setUserLocation(defaultLocation);
-          if (mapRef.current) {
-            mapRef.current.setView(defaultLocation, 12);
-          }
+          setUserLocation([77.2090, 28.6139]); // New Delhi
         }
       );
     }
@@ -186,12 +209,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   const handleSearchResultClick = (result: SearchResult) => {
     const lat = parseFloat(result.lat);
     const lon = parseFloat(result.lon);
-    const location = new LatLng(lat, lon);
-    
-    if (mapRef.current) {
-      mapRef.current.setView(location, 18);
-    }
-    
+    setUserLocation([lon, lat]);
     setSearchQuery(result.display_name);
     setShowSearchResults(false);
   };
@@ -201,19 +219,18 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
       alert('Geolocation is not supported by this browser.');
       return;
     }
-
     setIsLocating(true);
     navigator.geolocation.getCurrentPosition(
       (position) => {
         const { latitude, longitude } = position.coords;
-        const location = new LatLng(latitude, longitude);
-        setUserLocation(location);
+        setUserLocation([longitude, latitude]);
         setCorrectedLocation(null); // Reset corrected location
-        
-        if (mapRef.current) {
-          mapRef.current.setView(location, 20); // Maximum zoom level
-        }
         setIsLocating(false);
+        // Center the map on the new location
+        const map = (mapRef.current?.getMap?.() || mapRef.current);
+        if (map?.flyTo) {
+          map.flyTo({ center: [longitude, latitude], zoom: 16 });
+        }
       },
       (error) => {
         console.error('Error getting location:', error);
@@ -230,11 +247,10 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
 
   const handleSignIn = () => {
     setShowAuthDialog(true);
-    setAuthStep('email');
     setAuthError(null);
   };
 
-  const handleSendOtp = async () => {
+  const handleSendMagicLink = async () => {
     if (!email.trim()) {
       setAuthError('Please enter your email address');
       return;
@@ -242,36 +258,15 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
 
     setIsAuthenticating(true);
     setAuthError(null);
-    
+
     try {
       await signInWithEmail(email.trim());
-      setAuthStep('otp');
-    } catch (error: any) {
-      console.error('Error sending OTP:', error);
-      setAuthError(error.message || 'Failed to send OTP. Please try again.');
-    } finally {
-      setIsAuthenticating(false);
-    }
-  };
-
-  const handleVerifyOtp = async () => {
-    if (!otp.trim()) {
-      setAuthError('Please enter the OTP code');
-      return;
-    }
-
-    setIsAuthenticating(true);
-    setAuthError(null);
-    
-    try {
-      await verifyOtp(email.trim(), otp.trim());
+      alert('Check your email for the login link.');
       setShowAuthDialog(false);
-      setAuthStep('email');
       setEmail('');
-      setOtp('');
     } catch (error: any) {
-      console.error('Error verifying OTP:', error);
-      setAuthError(error.message || 'Invalid OTP. Please try again.');
+      console.error('Error sending magic link:', error);
+      setAuthError(error.message || 'Failed to send magic link. Please try again.');
     } finally {
       setIsAuthenticating(false);
     }
@@ -310,15 +305,40 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
   };
 
   const handleLoadPath = (path: SavedPath) => {
-    const pathCoords = path.coordinates.map(coord => new LatLng(coord[0], coord[1]));
-    setCurrentPath(pathCoords);
+    setCurrentPath(path.coordinates);
     setShowUserPaths(false);
-    
-    // Center map on the path
-    if (mapRef.current && pathCoords.length > 0) {
-      const bounds = pathCoords.reduce((bounds, coord) => bounds.extend(coord), new (window as any).L.LatLngBounds(pathCoords[0], pathCoords[0]));
-      mapRef.current.fitBounds(bounds, { padding: [20, 20] });
+    // Load vertex notes if present
+    const loadedNotes: Record<number, string> = {};
+    if (path.vertexData) {
+      Object.keys(path.vertexData).forEach((k) => {
+        const idx = Number(k);
+        const v = (path.vertexData as any)[k];
+        if (!Number.isNaN(idx) && v && typeof v.note === 'string') {
+          loadedNotes[idx] = v.note;
+        }
+      });
     }
+    setVertexNotes(loadedNotes);
+    setPathFinished(true);
+    // Center map on the path
+    try {
+      const map = (mapRef.current?.getMap?.() || mapRef.current);
+      if (!map || !path.coordinates || path.coordinates.length === 0) return;
+      let minLng = Infinity, minLat = Infinity, maxLng = -Infinity, maxLat = -Infinity;
+      for (const [lng, lat] of path.coordinates) {
+        if (lng < minLng) minLng = lng;
+        if (lat < minLat) minLat = lat;
+        if (lng > maxLng) maxLng = lng;
+        if (lat > maxLat) maxLat = lat;
+      }
+      if (isFinite(minLng) && isFinite(minLat) && isFinite(maxLng) && isFinite(maxLat)) {
+        if (Math.abs(maxLng - minLng) < 1e-6 && Math.abs(maxLat - minLat) < 1e-6) {
+          map.flyTo?.({ center: [minLng, minLat], zoom: 17 });
+        } else if (map.fitBounds) {
+          map.fitBounds([[minLng, minLat], [maxLng, maxLat]], { padding: 60, maxZoom: 18, duration: 800 });
+        }
+      }
+    } catch (_) {}
   };
 
   const handleSaveUserPath = async () => {
@@ -326,42 +346,43 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
       alert('Please sign in to save paths.');
       return;
     }
-
     if (currentPath.length < 2) {
       alert('Please draw a path with at least 2 points before saving.');
       return;
     }
-
     if (!pathName.trim()) {
       alert('Please enter a name for your path.');
       return;
     }
-
     setIsSaving(true);
     try {
+      // Convert notes to vertexData payload
+      const vertexData: Record<string, any> = {};
+      Object.keys(vertexNotes).forEach((k) => {
+        vertexData[String(k)] = { note: vertexNotes[Number(k)] };
+      });
       const pathData = {
         name: pathName.trim(),
         description: pathDescription.trim(),
-        coordinates: currentPath.map(point => [point.lat, point.lng] as [number, number]),
+        coordinates: currentPath,
         createdAt: new Date().toISOString(),
-        userLocation: userLocation ? [userLocation.lat, userLocation.lng] as [number, number] : undefined
+        userLocation: userLocation ? userLocation : undefined,
+        vertexData,
       };
-
-      await saveUserPath(pathData);
+  console.log('[handleSaveUserPath] Payload', pathData);
+  await saveUserPath(pathData);
       setSaveSuccess(true);
       setPathName('');
       setPathDescription('');
-      
       setTimeout(() => {
         setSaveSuccess(false);
         setShowSaveDialog(false);
       }, 2000);
-      
-      // Reload user paths
       loadUserPaths();
-    } catch (error) {
+    } catch (error: any) {
       console.error('Error saving path:', error);
-      alert('Failed to save path. Please try again.');
+      const msg = error?.message || error?.error || 'Failed to save path. Please try again.';
+      alert(msg);
     } finally {
       setIsSaving(false);
     }
@@ -383,172 +404,25 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     }
   };
 
-  const DrawingHandler = () => {
-    useMapEvents({
-      click: (e) => {
-        if (isDrawing) {
-          setCurrentPath(prev => [...prev, e.latlng]);
-        }
-      }
-    });
-    return null;
-  };
-
-  const PathRenderer = () => {
-    const map = useMap();
-    
-    useEffect(() => {
-      if (currentPath.length > 0) {
-        // Clear existing path markers and lines
-        pathMarkersRef.current.forEach(marker => {
-          map.removeLayer(marker);
-        });
-        pathMarkersRef.current = [];
-
-        // Clear existing path lines
-        map.eachLayer((layer: any) => {
-          if (layer.options && layer.options.className === 'custom-path') {
-            map.removeLayer(layer);
-          }
-        });
-
-        // Draw new path
-        if (currentPath.length > 1) {
-          const L = (window as any).L;
-          const polyline = L.polyline(currentPath, {
-            color: '#10B981',
-            weight: 4,
-            opacity: 0.8,
-            className: 'custom-path'
-          }).addTo(map);
-
-          // Add markers for start and end
-          if (currentPath.length >= 2) {
-            const startMarker = L.marker(currentPath[0], {
-              icon: L.divIcon({
-                html: '<div class="w-4 h-4 bg-blue-500 rounded-full border-2 border-white shadow-lg"></div>',
-                className: 'custom-marker',
-                iconSize: [16, 16]
-              })
-            }).addTo(map);
-
-            const endMarker = L.marker(currentPath[currentPath.length - 1], {
-              icon: L.divIcon({
-                html: '<div class="w-4 h-4 bg-red-500 rounded-full border-2 border-white shadow-lg"></div>',
-                className: 'custom-marker',
-                iconSize: [16, 16]
-              })
-            }).addTo(map);
-
-            pathMarkersRef.current = [startMarker, endMarker];
-          }
-        }
-
-        // Add intermediate point markers
-        if (currentPath.length > 2) {
-          const L = (window as any).L;
-          for (let i = 1; i < currentPath.length - 1; i++) {
-            const intermediateMarker = L.marker(currentPath[i], {
-              icon: L.divIcon({
-                html: '<div class="w-3 h-3 bg-green-500 rounded-full border-2 border-white shadow-lg"></div>',
-                className: 'custom-marker',
-                iconSize: [12, 12]
-              })
-            }).addTo(map);
-            pathMarkersRef.current.push(intermediateMarker);
-          }
-        }
-      }
-    }, [currentPath, map]);
-
-    return null;
-  };
-
-  const UserLocationMarker = () => {
-    const map = useMap();
-    
-    useEffect(() => {
-      if (userLocation) {
-        // Remove existing user location marker
-        if (userLocationMarkerRef.current) {
-          map.removeLayer(userLocationMarkerRef.current);
-        }
-
-        // Add user location marker (blue - default GPS location)
-        const L = (window as any).L;
-        userLocationMarkerRef.current = L.marker(userLocation, {
-          icon: L.divIcon({
-            html: '<div class="w-6 h-6 bg-blue-500 rounded-full border-4 border-white shadow-lg flex items-center justify-center animate-pulse"><div class="w-2 h-2 bg-white rounded-full"></div></div>',
-            className: 'user-location-marker',
-            iconSize: [24, 24]
-          })
-        }).addTo(map).bindPopup('Your GPS Location (Default)', {
-          offset: [0, -15],
-          closeButton: true,
-          autoClose: false,
-          closeOnClick: false
-        });
-      }
-    }, [userLocation, map]);
-
-    return null;
-  };
-
-  const CorrectedLocationMarker = () => {
-    const map = useMap();
-    
-    useEffect(() => {
-      if (correctedLocation) {
-        // Remove existing corrected location marker
-        if (correctedLocationMarkerRef.current) {
-          map.removeLayer(correctedLocationMarkerRef.current);
-        }
-
-        // Add corrected location marker (orange - user corrected)
-        const L = (window as any).L;
-        correctedLocationMarkerRef.current = L.marker(correctedLocation, {
-          icon: L.divIcon({
-            html: '<div class="w-7 h-7 bg-orange-500 rounded-full border-4 border-white shadow-lg flex items-center justify-center"><div class="w-3 h-3 bg-white rounded-full"></div></div>',
-            className: 'corrected-location-marker',
-            iconSize: [28, 28]
-          }),
-          draggable: true
-        }).addTo(map).bindPopup('Your Corrected Location (Drag to adjust)', {
-          offset: [0, -20],
-          closeButton: true,
-          autoClose: false,
-          closeOnClick: false
-        });
-
-        // Handle dragging
-        correctedLocationMarkerRef.current.on('dragend', (e: any) => {
-          const newPosition = e.target.getLatLng();
-          setCorrectedLocation(newPosition);
-        });
-      }
-    }, [correctedLocation, map]);
-
-    return null;
-  };
-
-  const LocationClickHandler = () => {
-    useMapEvents({
-      click: (e) => {
-        if (!isDrawing && userLocation && !correctedLocation) {
-          // Allow user to set corrected location by clicking on map
-          setCorrectedLocation(e.latlng);
-          setShowAccuracyReport(true);
-        }
-      }
-    });
-    return null;
-  };
+  // All Leaflet/React-Leaflet drawing and marker logic removed for Mapbox migration.
 
   const handleStartDrawing = () => {
-    setIsDrawing(!isDrawing);
-    if (isDrawing) {
-      // Stop drawing
+    const next = !isDrawing;
+    setIsDrawing(next);
+    if (next) {
+      // Begin new drawing session
       setCurrentPath([]);
+      setVertexNotes({});
+      setActiveNoteIndex(null);
+      setNoteDraft('');
+      setPathFinished(false);
+    } else {
+      // Cancel drawing, clear sketch
+      setCurrentPath([]);
+      setVertexNotes({});
+      setActiveNoteIndex(null);
+      setNoteDraft('');
+      setPathFinished(false);
     }
   };
 
@@ -557,21 +431,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     setIsDrawing(false);
     
     // Clear path markers
-    pathMarkersRef.current.forEach(marker => {
-      if (mapRef.current) {
-        mapRef.current.removeLayer(marker);
-      }
-    });
-    pathMarkersRef.current = [];
-    
-    // Clear path lines from map
-    if (mapRef.current) {
-      mapRef.current.eachLayer((layer: any) => {
-        if (layer.options && layer.options.className === 'custom-path') {
-          mapRef.current!.removeLayer(layer);
-        }
-      });
-    }
+  // No marker cleanup needed for Mapbox version
   };
 
   const handleReportAccuracy = async () => {
@@ -583,8 +443,8 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     setIsReporting(true);
     try {
       const report: LocationReport = {
-        defaultLocation: [userLocation.lat, userLocation.lng],
-        correctedLocation: [correctedLocation.lat, correctedLocation.lng],
+  defaultLocation: userLocation,
+  correctedLocation: correctedLocation,
         timestamp: new Date().toISOString()
       };
 
@@ -610,13 +470,19 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
 
     setIsSharing(true);
     try {
+      const vertexData: Record<string, any> = {};
+      Object.keys(vertexNotes).forEach((k) => {
+        vertexData[String(k)] = { note: vertexNotes[Number(k)] };
+      });
       const pathData = {
-        coordinates: currentPath.map(point => [point.lat, point.lng]),
+        coordinates: currentPath,
         createdAt: new Date().toISOString(),
-        userLocation: userLocation ? [userLocation.lat, userLocation.lng] : null
+        userLocation: userLocation ? userLocation : undefined,
+        vertexData,
       };
 
-      const pathId = await savePath(pathData);
+  console.log('[handleShare] Payload', pathData);
+  const pathId = await savePath(pathData);
       const shareUrl = `${window.location.origin}${window.location.pathname}?path=${pathId}`;
       
       // Copy to clipboard
@@ -634,9 +500,156 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
     }
   };
 
-  const tileUrl = mapType === 'satellite' 
-    ? 'https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}'
-    : 'https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png';
+  // helper to disable terrain/buildings safely
+  const disable3D = (map: any) => {
+    try { map.setTerrain(null); } catch (_) {}
+    try { if (map.getLayer('3d-buildings')) map.removeLayer('3d-buildings'); } catch (_) {}
+    try { if (map.getLayer('3d-buildings-fallback')) map.removeLayer('3d-buildings-fallback'); } catch (_) {}
+    try { map.setPitch?.(0); } catch (_) {}
+    // keep sky; it’s harmless, but remove if desired
+  };
+
+  // GeoJSON for vertex points
+  const verticesGeoJson = useMemo(() => {
+    return {
+      type: 'FeatureCollection',
+      features: currentPath.map((coord, idx) => ({
+        type: 'Feature',
+        properties: {
+          idx,
+          isStart: idx === 0,
+          isEnd: pathFinished && idx === currentPath.length - 1,
+          note: vertexNotes[idx] || ''
+        },
+        geometry: { type: 'Point', coordinates: coord }
+      }))
+    } as any;
+  }, [currentPath, pathFinished, vertexNotes]);
+
+  // enhance existing onLoad handler to respect enable3D
+  const onLoad = (evt: any) => {
+    const map = evt.target;
+    // Re-apply when style changes (e.g., switching standard/satellite)
+    try {
+      map.on?.('style.load', () => {
+        if (enable3D) handleMapLoad({ target: map }); else disable3D(map);
+      });
+      // Bind vertex layer click for note editing (Mapbox GL only)
+      map.on?.('click', 'vertex-circles', (e: any) => {
+        const f = e?.features?.[0];
+        const idx = f?.properties?.idx;
+        if (idx !== undefined && idx !== null) {
+          setActiveNoteIndex(Number(idx));
+          setNoteDraft(vertexNotes[Number(idx)] || '');
+        }
+      });
+    } catch (_) {}
+
+    if (!enable3D) { disable3D(map); return; }
+    handleMapLoad(evt); // previously added safe loader
+  };
+
+  // onLoad handler for Map component
+  const handleMapLoad = (evt: any) => {
+    try {
+      const map = evt.target;
+      const hasToken = Boolean(import.meta.env.VITE_MAPBOX_TOKEN);
+
+      // Only attempt 3D features when using Mapbox GL with a Mapbox style
+      if (!hasToken) return;
+
+      const style = map.getStyle?.();
+      if (!style || !style.sources) return;
+
+      // Ensure a DEM source exists, else add one
+      const demSourceId = 'mapbox-dem';
+      if (!map.getSource(demSourceId)) {
+        // Add DEM source only if style is Mapbox and supports it
+        map.addSource(demSourceId, {
+          type: 'raster-dem',
+          url: 'mapbox://mapbox.mapbox-terrain-dem-v1',
+          tileSize: 512,
+          maxzoom: 14,
+        });
+      }
+
+      // Set terrain safely
+      try {
+        map.setTerrain({ source: demSourceId, exaggeration: 1.0 });
+  // If 3D is enabled, ensure a pleasant tilt
+  map.setPitch?.(60);
+      } catch (e) {
+        // ignore if terrain not supported
+      }
+
+      // Add sky layer if missing
+      if (!map.getLayer('sky')) {
+        try {
+          map.addLayer({
+            id: 'sky',
+            type: 'sky',
+            paint: {
+              'sky-type': 'atmosphere',
+              'sky-atmosphere-sun': [0.0, 0.0],
+              'sky-atmosphere-sun-intensity': 15,
+            },
+          });
+        } catch (e) {
+          // ignore if sky not supported
+        }
+      }
+
+      // Add 3D buildings using extrusion if not present
+      // Use Mapbox composite source if available
+      const hasComposite = Boolean(style.sources['composite']);
+      if (hasComposite && !map.getLayer('3d-buildings')) {
+        try {
+          map.addLayer(
+            {
+              id: '3d-buildings',
+              source: 'composite',
+              'source-layer': 'building',
+              filter: ['==', ['get', 'extrude'], 'true'],
+              type: 'fill-extrusion',
+              minzoom: 15,
+              paint: {
+                'fill-extrusion-color': '#aaa',
+                // Use height and base height properties for realistic extrusion
+                'fill-extrusion-height': ['get', 'height'],
+                'fill-extrusion-base': ['get', 'min_height'],
+                'fill-extrusion-opacity': 0.6,
+              },
+            },
+            // Place 3D buildings beneath labels if available
+            style.layers?.find((l: any) => l.type && String(l.type).includes('symbol'))?.id || undefined
+          );
+        } catch (e) {
+          // If the specific filter fails, try a more generic 3D building layer
+          if (!map.getLayer('3d-buildings-fallback')) {
+            try {
+              map.addLayer({
+                id: '3d-buildings-fallback',
+                source: 'composite',
+                'source-layer': 'building',
+                type: 'fill-extrusion',
+                minzoom: 15,
+                paint: {
+                  'fill-extrusion-color': '#bbb',
+                  'fill-extrusion-height': ['coalesce', ['get', 'height'], 20],
+                  'fill-extrusion-opacity': 0.5,
+                },
+              });
+            } catch (_) {
+              // give up quietly
+            }
+          }
+        }
+      }
+    } catch (err) {
+      // Swallow errors to avoid breaking map interaction
+      // console.debug('Map onLoad 3D setup skipped:', err);
+    }
+  };
 
   return (
     <div className="bg-white rounded-2xl shadow-xl overflow-hidden">
@@ -777,6 +790,21 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
               </span>
             </button>
 
+            {/* 3D toggle */}
+            <button
+              onClick={() => {
+                const next = !enable3D;
+                setEnable3D(next);
+                const map = (mapRef.current?.getMap?.() || mapRef.current);
+                try { map?.setPitch?.(next ? 60 : 0); } catch (_) {}
+              }}
+              className={`flex items-center space-x-2 px-3 py-2 rounded-lg border ${enable3D ? 'bg-white border-gray-300 hover:bg-gray-50' : 'bg-white border-gray-300 hover:bg-gray-50'}`}
+              title="Toggle 3D terrain and buildings"
+            >
+              <MapIcon className="w-4 h-4" />
+              <span className="text-sm font-medium">{enable3D ? '3D: On' : '3D: Off'}</span>
+            </button>
+
             {currentPath.length > 0 && (
               <button
                 onClick={handleClearPath}
@@ -828,8 +856,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
         {isDrawing && (
           <div className="mt-3 p-3 bg-blue-50 border border-blue-200 rounded-lg">
             <p className="text-sm text-blue-700">
-              <strong>Drawing Mode Active:</strong> Click on the map to add points to your path. 
-              Click "Stop Drawing\" when you're done.
+              <strong>Drawing Mode Active:</strong> Click to add vertices. Double-tap to finish. Click a vertex to add a note.
             </p>
           </div>
         )}
@@ -843,30 +870,156 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
         )}
       </div>
 
-      {/* Map Container */}
+      {/* Mapbox GL JS Map Section */}
       <div className="h-96 md:h-[500px] relative">
-        <MapContainer
-          center={[28.6139, 77.2090]}
-          zoom={13}
-          className="h-full w-full"
+        <Map
           ref={mapRef}
-        >
-          <TileLayer
-            url={tileUrl}
-            attribution={mapType === 'satellite' 
-              ? '&copy; Esri &mdash; Source: Esri, Maxar, GeoEye, Earthstar Geographics, CNES/Airbus DS, USDA, USGS, AeroGRID, IGN, and the GIS User Community'
-              : '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
+          initialViewState={{
+            longitude: userLocation ? userLocation[0] : 77.2090,
+            latitude: userLocation ? userLocation[1] : 28.6139,
+            zoom: 16,
+            pitch: enable3D ? 60 : 0,
+            bearing: 0,
+          }}
+          dragPan
+          dragRotate
+          scrollZoom
+          touchPitch
+          keyboard
+          mapStyle={
+            import.meta.env.VITE_MAPBOX_TOKEN
+              ? (mapType === 'satellite'
+                  ? 'mapbox://styles/mapbox/satellite-streets-v12'
+                  : 'mapbox://styles/mapbox/streets-v12')
+              : (mapType === 'satellite'
+                  ? 'https://basemaps.cartocdn.com/gl/voyager-gl-style/style.json'
+                  : 'https://basemaps.cartocdn.com/gl/positron-gl-style/style.json')
+          }
+          maxZoom={24}
+          minZoom={3}
+          style={{ width: '100%', height: '100%' }}
+          mapLib={(import.meta.env.VITE_MAPBOX_TOKEN ? (mapboxgl as any) : (maplibregl as any))}
+          mapboxAccessToken={import.meta.env.VITE_MAPBOX_TOKEN}
+          interactiveLayerIds={['vertex-circles']}
+          onLoad={onLoad}
+          onClick={e => {
+            // If clicked on a vertex, open note editor
+            try {
+              const map = (mapRef.current?.getMap?.() || mapRef.current);
+              const features = map?.queryRenderedFeatures?.(e.point, { layers: ['vertex-circles'] }) || [];
+              if (features.length) {
+                const f = features[0];
+                const idx = f?.properties?.idx;
+                if (idx !== undefined && idx !== null) {
+                  setActiveNoteIndex(Number(idx));
+                  setNoteDraft(vertexNotes[Number(idx)] || '');
+                  return;
+                }
+              }
+            } catch (_) {}
+            if (isDrawing) {
+              const { lng, lat } = e.lngLat;
+              // Detect double-tap to finish: if previous vertex exists and time delta small
+              const now = Date.now();
+              const last = (window as any).__lastTapTime || 0;
+              (window as any).__lastTapTime = now;
+              const isDouble = now - last < 350; // 350ms threshold
+              if (isDouble && currentPath.length >= 1) {
+                setPathFinished(true);
+                setIsDrawing(false);
+                // Highlight last vertex in red by re-render conditionally
+                return;
+              }
+              setCurrentPath(prev => [...prev, [lng, lat]]);
+            } else if (!isDrawing && userLocation && !correctedLocation) {
+              // Allow user to set corrected location by clicking on map
+              setCorrectedLocation([e.lngLat.lng, e.lngLat.lat]);
+              setShowAccuracyReport(true);
             }
-          />
-          <DrawingHandler />
-          <LocationClickHandler />
-          <PathRenderer />
-          <UserLocationMarker />
-          <CorrectedLocationMarker />
-        </MapContainer>
+          }}
+        >
+          <NavigationControl />
+          {/* User location marker */}
+          {userLocation && (
+            <Marker longitude={userLocation[0]} latitude={userLocation[1]}>
+              <div style={{background:'#0074D9',borderRadius:'50%',width:16,height:16,border:'2px solid #fff'}} />
+            </Marker>
+          )}
+          {/* Corrected location marker (draggable) */}
+          {correctedLocation && (
+            <Marker
+              longitude={correctedLocation[0]}
+              latitude={correctedLocation[1]}
+              draggable
+              onDragEnd={e => setCorrectedLocation([e.lngLat.lng, e.lngLat.lat])}
+            >
+              <div style={{background:'#FFA500',borderRadius:'50%',width:20,height:20,border:'2px solid #fff'}} />
+            </Marker>
+          )}
+          {/* Drawn path as a line */}
+          {currentPath.length > 1 && (
+            <Source id="drawn-path" type="geojson" data={{
+              type: 'Feature',
+              properties: {},
+              geometry: { type: 'LineString', coordinates: currentPath }
+            }}>
+              <Layer id="drawn-path" type="line" paint={{ 'line-color': '#0074D9', 'line-width': 4 }} />
+            </Source>
+          )}
 
+          {/* Vertex points as a circle layer for crisp rendering */}
+          {currentPath.length > 0 && (
+            <Source id="vertices" type="geojson" data={verticesGeoJson}>
+              <Layer
+                id="vertex-circles"
+                type="circle"
+                paint={{
+                  'circle-radius': 7,
+                  'circle-color': ['case', ['get', 'isStart'], '#22c55e', ['case', ['get', 'isEnd'], '#ef4444', '#1f2937']],
+                  'circle-stroke-color': '#ffffff',
+                  'circle-stroke-width': 2,
+                }}
+              />
+            </Source>
+          )}
+
+          {/* Note editor popup */}
+          {activeNoteIndex !== null && currentPath[activeNoteIndex] && (
+            <Popup
+              longitude={currentPath[activeNoteIndex][0]}
+              latitude={currentPath[activeNoteIndex][1]}
+              closeOnClick={false}
+              onClose={() => setActiveNoteIndex(null)}
+              anchor="top"
+            >
+              <div style={{ minWidth: 220 }}>
+                <div className="text-sm font-medium mb-2">Vertex Note</div>
+                <textarea
+                  value={noteDraft}
+                  onChange={(e) => setNoteDraft(e.target.value)}
+                  rows={3}
+                  className="w-full p-2 border border-gray-300 rounded"
+                  placeholder="Add a message for this point"
+                />
+                <div className="flex justify-end space-x-2 mt-2">
+                  <button className="px-2 py-1 text-sm border rounded" onClick={() => setActiveNoteIndex(null)}>Cancel</button>
+                  <button
+                    className="px-2 py-1 text-sm bg-blue-600 text-white rounded"
+                    onClick={() => {
+                      if (activeNoteIndex === null) return;
+                      setVertexNotes((prev) => ({ ...prev, [activeNoteIndex]: noteDraft }));
+                      setActiveNoteIndex(null);
+                    }}
+                  >
+                    Save
+                  </button>
+                </div>
+              </div>
+            </Popup>
+          )}
+        </Map>
         {/* Instructions Overlay */}
-        {currentPath.length === 0 && !isDrawing && (
+  {currentPath.length === 0 && !isDrawing && !userLocation && (
           <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
             <div className="bg-white/90 backdrop-blur-sm p-6 rounded-xl shadow-lg max-w-sm text-center">
               <Navigation className="w-8 h-8 text-blue-500 mx-auto mb-3" />
@@ -923,7 +1076,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
           <div className="bg-white rounded-xl shadow-2xl max-w-md w-full p-6">
             <div className="flex items-center justify-between mb-6">
               <h3 className="text-lg font-semibold text-gray-900">
-                {authStep === 'email' ? 'Sign in with Email' : 'Enter Verification Code'}
+                Sign in with Email
               </h3>
               <button
                 onClick={() => setShowAuthDialog(false)}
@@ -933,93 +1086,40 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
               </button>
             </div>
 
-            {authStep === 'email' ? (
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Email Address
-                  </label>
-                  <input
-                    type="email"
-                    value={email}
-                    onChange={(e) => setEmail(e.target.value)}
-                    placeholder="Enter your email"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
-                    onKeyPress={(e) => e.key === 'Enter' && handleSendOtp()}
-                  />
-                </div>
-                
-                {authError && (
-                  <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                    <p className="text-sm text-red-700">{authError}</p>
-                  </div>
-                )}
-                
-                <button
-                  onClick={handleSendOtp}
-                  disabled={isAuthenticating}
-                  className={`w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-lg transition-all ${
-                    isAuthenticating
-                      ? 'bg-gray-400 cursor-not-allowed'
-                      : 'bg-blue-500 hover:bg-blue-600'
-                  } text-white`}
-                >
-                  <Mail className="w-4 h-4" />
-                  <span>{isAuthenticating ? 'Sending...' : 'Send Verification Code'}</span>
-                </button>
+            <div className="space-y-4">
+              <div>
+                <label className="block text-sm font-medium text-gray-700 mb-1">
+                  Email Address
+                </label>
+                <input
+                  type="email"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  placeholder="Enter your email"
+                  className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                  onKeyPress={(e) => e.key === 'Enter' && handleSendMagicLink()}
+                />
               </div>
-            ) : (
-              <div className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">
-                    Verification Code
-                  </label>
-                  <input
-                    type="text"
-                    value={otp}
-                    onChange={(e) => setOtp(e.target.value)}
-                    placeholder="Enter 6-digit code"
-                    className="w-full px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500 focus:border-transparent text-center text-lg tracking-widest"
-                    maxLength={6}
-                    onKeyPress={(e) => e.key === 'Enter' && handleVerifyOtp()}
-                  />
-                  <p className="text-xs text-gray-500 mt-1">
-                    Check your email for the verification code
-                  </p>
+              
+              {authError && (
+                <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
+                  <p className="text-sm text-red-700">{authError}</p>
                 </div>
-                
-                {authError && (
-                  <div className="p-3 bg-red-50 border border-red-200 rounded-lg">
-                    <p className="text-sm text-red-700">{authError}</p>
-                  </div>
-                )}
-                
-                <div className="flex space-x-3">
-                  <button
-                    onClick={() => {
-                      setAuthStep('email');
-                      setOtp('');
-                      setAuthError(null);
-                    }}
-                    className="flex-1 px-4 py-2 border border-gray-300 rounded-lg text-gray-700 hover:bg-gray-50 transition-colors"
-                  >
-                    Back
-                  </button>
-                  <button
-                    onClick={handleVerifyOtp}
-                    disabled={isAuthenticating}
-                    className={`flex-1 flex items-center justify-center space-x-2 px-4 py-2 rounded-lg transition-all ${
-                      isAuthenticating
-                        ? 'bg-gray-400 cursor-not-allowed'
-                        : 'bg-green-500 hover:bg-green-600'
-                    } text-white`}
-                  >
-                    <CheckCircle className="w-4 h-4" />
-                    <span>{isAuthenticating ? 'Verifying...' : 'Verify & Sign In'}</span>
-                  </button>
-                </div>
-              </div>
-            )}
+              )}
+              
+              <button
+                onClick={handleSendMagicLink}
+                disabled={isAuthenticating}
+                className={`w-full flex items-center justify-center space-x-2 px-4 py-2 rounded-lg transition-all ${
+                  isAuthenticating
+                    ? 'bg-gray-400 cursor-not-allowed'
+                    : 'bg-blue-500 hover:bg-blue-600'
+                } text-white`}
+              >
+                <Mail className="w-4 h-4" />
+                <span>{isAuthenticating ? 'Sending...' : 'Send Magic Link'}</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -1173,7 +1273,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
                 <div>
                   <p className="text-sm font-medium text-blue-900">GPS Location (Default)</p>
                   <p className="text-xs text-blue-700">
-                    {userLocation.lat.toFixed(6)}, {userLocation.lng.toFixed(6)}
+                    {userLocation[1].toFixed(6)}, {userLocation[0].toFixed(6)}
                   </p>
                 </div>
               </div>
@@ -1183,7 +1283,7 @@ const MapInterface: React.FC<MapInterfaceProps> = ({ onPathShared }) => {
                 <div>
                   <p className="text-sm font-medium text-orange-900">Corrected Location</p>
                   <p className="text-xs text-orange-700">
-                    {correctedLocation.lat.toFixed(6)}, {correctedLocation.lng.toFixed(6)}
+                    {correctedLocation[1].toFixed(6)}, {correctedLocation[0].toFixed(6)}
                   </p>
                 </div>
               </div>

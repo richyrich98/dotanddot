@@ -44,7 +44,8 @@ export const savePath = async (pathData: PathData): Promise<string> => {
       // Simulate network delay for consistency with original implementation
       setTimeout(async () => {
         try {
-          const { data, error } = await supabase
+          console.log('[savePath] Attempt primary save', { pathId, coordsCount: pathData.coordinates.length, hasVertexData: !!pathData.vertexData });
+          let { data, error } = await supabase
             .from('shared_paths')
             .insert({
               path_id: pathId,
@@ -56,9 +57,31 @@ export const savePath = async (pathData: PathData): Promise<string> => {
             .single();
 
           if (error) {
-            console.error('Error saving to Supabase:', error);
-            reject(new Error('Failed to save path'));
-            return;
+            console.warn('[savePath] Primary insert failed', error);
+            // Fallback: retry without vertex_data
+            if (String(error.message || '').toLowerCase().includes('vertex') || String(error.details || '').toLowerCase().includes('vertex')) {
+              console.log('[savePath] Retrying without vertex_data');
+              const fallback = await supabase
+                .from('shared_paths')
+                .insert({
+                  path_id: pathId,
+                  coordinates: pathData.coordinates,
+                  user_location: pathData.userLocation
+                })
+                .select()
+                .single();
+              error = fallback.error;
+              data = fallback.data;
+              if (error) {
+                console.error('[savePath] Fallback failed', error);
+                reject(new Error('Failed to save path'));
+                return;
+              }
+            } else {
+              console.error('[savePath] Non-vertex error', error);
+              reject(new Error('Failed to save path'));
+              return;
+            }
           }
 
           console.log('Path saved with ID:', pathId);
@@ -132,8 +155,8 @@ export const saveUserPath = async (pathData: PathData & { name: string; descript
     if (!user) {
       throw new Error('User must be authenticated to save paths');
     }
-
-    const { data, error } = await supabase
+    console.log('[saveUserPath] Attempt', { name: pathData.name, coords: pathData.coordinates.length, hasVertexData: !!pathData.vertexData });
+    let { data, error } = await supabase
       .from('user_paths')
       .insert({
         user_id: user.id,
@@ -147,8 +170,30 @@ export const saveUserPath = async (pathData: PathData & { name: string; descript
       .single();
 
     if (error) {
-      console.error('Error saving user path to Supabase:', error);
-      throw new Error('Failed to save path');
+      console.warn('[saveUserPath] Primary insert failed', error);
+      if (String(error.message || '').toLowerCase().includes('vertex') || String(error.details || '').toLowerCase().includes('vertex')) {
+        console.log('[saveUserPath] Retrying without vertex_data');
+        const fallback = await supabase
+          .from('user_paths')
+          .insert({
+            user_id: user.id,
+            name: pathData.name,
+            description: pathData.description || '',
+            coordinates: pathData.coordinates,
+            user_location: pathData.userLocation
+          })
+          .select()
+          .single();
+        error = fallback.error;
+        data = fallback.data;
+        if (error) {
+          console.error('[saveUserPath] Fallback failed', error);
+          throw new Error('Failed to save path');
+        }
+      } else {
+        console.error('[saveUserPath] Non-vertex error', error);
+        throw new Error('Failed to save path');
+      }
     }
 
     console.log('User path saved with ID:', data.id);
